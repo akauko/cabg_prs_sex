@@ -4,7 +4,7 @@ Code for the project: "Sex-Specific Genetic Risks for Adverse Outcomes  After Co
 We studied the sex-specific differences in associations of polygenic risk scores (PRSs) with atrial fibrillation, ischemic stroke, intracranial hemorrhage, myocardial infarction, and gastrointestinal hemorrhage in coronary revascularization patients. 
 
 * Data: FinnGen https://www.finngen.fi/en
-* Description of variables: https://risteys.finngen.fi/
+* Description of variables: https://risteys.finregistry.fi/
 * Description of registries: https://finngen.gitbook.io/finngen-analyst-handbook/finngen-data-specifics/finnish-health-registers-and-medical-coding
 * Data access: https://site.fingenious.fi/en/
 * PRS values were calculuted for FinnGen individuals using PRS-CS pipeline with default settings: https://github.com/getian107/PRScs
