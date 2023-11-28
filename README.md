@@ -14,12 +14,11 @@ We studied the sex-specific differences in associations of polygenic risk scores
 ht_prs_preg
 ├── README.md                   # Overview
 ├── cabg_af_prs_sex3.rmd        # R markdown for the analysis
-├── scripts
-  ├── functions2.R                     # Minor R functions for the analysis
-  ├── prs_calculations                 # Directory: PRS calculations
-	├── preprocess_ukb_for_prscs.bash	# Preprocesses ukb gwas summary statistics for PRS-CS
-	├── prs_ukb3.wdl			# Runs PRS-CS at FinnGen for one endpoint and all sexes.
-	├── generate_prs_scores.bash		# Processes PRS_CS output and calculates weights for FinnGen individuals
-	├── reformat_raw_prs.R 			# Is required by 'generate_prs_scores.bash'
+├── functions2.R                # Minor R functions for the analysis
+├── prs_calculations            # Directory: PRS calculations
+   ├── preprocess_ukb_for_prscs.bash     # Preprocesses ukb gwas summary statistics for PRS-CS
+   ├── prs_ukb3.wdl                      # Runs PRS-CS at FinnGen for one endpoint and all sexes.
+   ├── generate_prs_scores.bash          # Processes PRS_CS output and calculates weights for FinnGen individuals
+   ├── reformat_raw_prs.R                # Is required by 'generate_prs_scores.bash'
 
 ```
