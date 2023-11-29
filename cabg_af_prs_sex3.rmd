@@ -1,0 +1,925 @@
+---
+title: "AF PRS vs. AF after revascularization"
+editor_options:
+  chunk_output_type: console
+output:
+  html_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+
+**Libraries**
+
+
+```{r}
+
+#install.packages("/home/ivm/R/src/packrat_0.5.0.tar.gz", repos=NULL, type="source")
+#install.packages("/finngen/green/tableone_0.12.0.tar.gz", repos=NULL, type="source")
+#install.packages("/finngen/green/compareC_1.3.1.tar.gz", repos=NULL, type="source")
+
+library(tidyverse)
+library(survival)   # survival analysis
+
+library(data.table) # fread() function
+library(gridExtra)  # plots to grid
+library(survminer)  # ggbased visualization and extra diagnostics
+#library(survRM2)    # restricted mean survival times
+#library(visdat)     # visualization of tibble and na's
+##library(forestplot) # forestplot
+library(compareC)   # compare c-index
+library(kableExtra) # Pretty tables
+library(tableone)   # Characteristics table
+
+source('functions2.R')
+
+data_path <- "data"
+prs_path <- "/home/ivm/ukb-prs-others/ukb_prs_R9"
+fig_path <- "figs2"
+
+```
+
+
+# Data
+
+## Variables
+
+**Operations**
+
+* I9_CABG, Coronary artery bypass crafting
+* I9_ANGIO, Coronary angiopasty
+* I9_REVASC, I9_CABG OR I9_ANGIO
+
+Three samples: patients *after* CABG, ANGIO and REVASC.
+
+**For polygenic riskscores**
+
+* I9_AF (ukb: 20002_1471), Atrial fibrillation
+* I9_CHD,	Major coronary heart disease event
+* I9_INTRACRA,	Nontraumatic intracranial haemmorrhage
+* I9_MI,	Myocardial infarction
+* I9_STR,	Stroke, excluding SAH
+* K11_GIBLEEDING,	GI-bleeding
+
+
+## Download & preprocess data
+
+
+**Copying and preprocessing at 'rather big machine'**
+
+Endpoint and covariate files transfered and unzipped. Columns selected from endpoint file prior to import to r, because the original phenotype file is very large.
+
+
+```{r, eval=F}
+
+pheno_in_path <- "/finngen/library-red/finngen_R9/phenotype_1.0/data"
+
+columns_pheno <- fread("data/fg_pheno_cols.txt", header=F)$V1
+columns_discovs <- fread("data/fg_chadsvasc_cols.txt", header=F)$V1
+columns <- c(columns_pheno, columns_discovs) %>% unique()
+
+#pheno_tmp <- vroom(str_glue("{pheno_in_path}/finngen_R9_endpoint_1.0.txt.gz"), 
+#                   col_select = c(FINNGENID, contains("I9_PULMEMB"), contains("I9_PHLETHROMBDVTLOW"))
+
+pheno_tmp <- fread(str_glue("{pheno_in_path}/finngen_R9_endpoint_1.0.txt.gz")) %>%
+  select(FINNGENID, all_of(columns))
+
+fwrite(pheno_tmp, str_glue("{data_path}/R9_endpoint_selected.tsv.gz"), sep="\t")
+
+```
+
+
+
+**Loading and combining the data**
+
+Downloading the data
+
+```{r}
+
+names_in <- list(I9_AF="20002_1471", I9_CHD="I9_CHD", I9_INTRACRA="I9_INTRACRA", I9_MI="I9_MI", I9_STR="I9_STR", K11_GIBLEEDING="K11_GIBLEEDING")
+#names_in <- c(I9_AF="20002_1471")
+
+#PRS scores
+prs_df.f <- lapply(as.list(names(names_in)), function(prsname) {
+
+  fread(str_glue("{prs_path}/{names_in[[prsname]]}.gwas.female.tsv.sscore")) %>%
+        select(IID, SCORE1_AVG) %>%
+        rename(FINNGENID = IID, !!paste(prsname, "SCORE.F", sep="_") := SCORE1_AVG )}
+  ) %>%
+  reduce(left_join, by = "FINNGENID")
+
+
+prs_df.m <- lapply(as.list(names(names_in)), function(prsname) {
+
+  fread(str_glue("{prs_path}/{names_in[[prsname]]}.gwas.male.tsv.sscore")) %>%
+        select(IID, SCORE1_AVG) %>%
+        rename(FINNGENID = IID, !!paste(prsname, "SCORE.M", sep="_") := SCORE1_AVG )}
+  ) %>%
+  reduce(left_join, by = "FINNGENID")
+
+
+#endpoints 
+#As FinnGen assignes NA's to similar endpoints, we must replace NA's
+phenotypes <- fread(str_glue("{data_path}/R9_endpoint_selected.tsv.gz")) %>%
+  mutate_at(vars(-FINNGENID, -ends_with("_AGE"), -ends_with("_YEAR")), ~if_else(is.na(.), 0L, .))
+
+#covariates
+covs_in <- fread("/finngen/library-red/finngen_R9/analysis_covariates/R9_COV_V1.FID.txt.gz") %>%
+  select(IID, SEX_IMPUTED, n_var, chip, starts_with("PC"), starts_with("IS"), batch,  ends_with("norm"), starts_with("BL"), "cohort") %>%
+  rename(FINNGENID = IID) %>%
+  mutate(batch2 = case_when(   #Let as create new batch variable with less levels
+    IS_FINNGEN1_CHIP == 1 ~ "FINNGEN1_CHIP",
+    IS_FINNGEN2_CHIP == 1 ~ "FINNGEN2_CHIP",
+    TRUE ~ batch) %>% as.factor) 
+
+```
+
+Combining the data 
+
+```{r}
+
+df <- phenotypes %>%
+  left_join(prs_df.f, by = "FINNGENID") %>%
+  left_join(prs_df.m, by = "FINNGENID") %>%
+  left_join(covs_in, by = "FINNGENID") %>%
+  as_tibble() %>%
+  mutate_at(c("batch2", "cohort"),as.factor) 
+
+```
+
+
+**Preprocess**
+
+Removing individuals without genetic information
+Also endpoint names are simplified.
+
+```{r}
+names_ep <- list("AF", "INTRACRA", "MI", "STR", "GIBLEEDING")
+
+#Total number of individuals
+dim(df)[1]
+
+#glimpse(df)
+#vis_dat(sample_n(df, 10000))
+df <- df %>% filter(!is.na(batch2)) %>%
+  rename_at(vars(contains('I9_')), list(~str_remove(., "I9_"))) %>%
+  rename_at(vars(contains('K11_')), list(~str_remove(., "K11_"))) %>%
+  rename_at(vars(contains('E4_')), list(~str_remove(., "E4_"))) %>%
+  rename_at(vars(contains('C_STRO')), list(~str_remove(., "C_"))) %>%
+  rename_at(vars(contains('N14_')), list(~str_remove(., "N14_"))) %>%
+  rename_at(vars(contains('ANGIO')), list(~str_replace(., "ANGIO", "PCI"))) %>%
+  #Variable on which event is the first REVASC, CABG or REVASC
+  mutate(CABG_FIRST = if_else(CABG_AGE == REVASC_AGE & CABG == 1, 1L, 0L))
+
+#vis_dat(sample_n(df, 10000))
+
+#Number of genotyped individuals
+dim(df)[1]
+
+```
+
+
+**Set SCORE according sex**
+
+```{r by gender}
+
+#Females and males treated separately and combined back together
+
+df.f <-  df %>%   
+  filter(SEX_IMPUTED==1) %>%
+  rename_at(vars(contains('SCORE.F')), list(~str_replace(., "SCORE.F", "SCORE"))) %>%
+  select(-contains('SCORE.M'))
+
+df.m <-  df %>%   
+  filter(SEX_IMPUTED==0) %>%
+  rename_at(vars(contains('SCORE.M')), list(~str_replace(., "SCORE.M", "SCORE")))%>%
+  select(-contains('SCORE.F'))
+
+df <- NULL
+
+
+```
+
+
+
+
+
+**Categorical variables & sex**
+
+Data is categorized and scaled separately for both genders.
+
+
+```{r}
+
+my_probs = c(0 , 0.25, 0.5, 0.75, 1)
+my_labels =  c("Q1", "Q2", "Q3", "Q4")
+my_ref = "Q1"
+
+
+#my_probs = c(0,0.025,0.2,0.8,0.975,1)
+#my_labels =  c("<2.5%","2.5-20%","20-80%","80-97.5%",">97.5%")
+
+#Females
+
+df.f <- df.f %>%
+  mutate_at(vars(contains('SCORE')), list(SCALED = ~scale(.)[,1])) %>%
+  rename_at(vars(contains('SCALED')), list(~str_remove(., "SCORE_"))) %>%     
+  mutate_at(vars(contains('SCORE')),
+            list(CAT = ~cut(., breaks=quantile(., probs = my_probs),
+                            labels=my_labels, include.lowest = T))) %>%
+  rename_at(vars(contains('CAT')), list(~str_remove(., "SCORE_"))) 
+
+
+df.m <- df.m %>%
+  mutate_at(vars(contains('SCORE')), list(SCALED = ~scale(.)[,1])) %>%
+  rename_at(vars(contains('SCALED')), list(~str_remove(., "SCORE_"))) %>%
+  mutate_at(vars(contains('SCORE')),
+            list(CAT = ~cut(., breaks=quantile(., probs = my_probs),
+                            labels=my_labels, include.lowest = T))) %>%
+  rename_at(vars(contains('CAT')), list(~str_remove(., "SCORE_"))) 
+
+```
+
+
+**Combining df.f + df.m**
+
+df is generated again to include scaled and categorized variables.
+
+```{r}
+
+df <- bind_rows(df.f, df.m) %>% arrange(FINNGENID)
+#vis_dat(sample_n(df, 5000))
+
+#Number of individuals:
+dim(df)[1]
+df %>% select(SEX_IMPUTED) %>% mutate_all(as.factor) %>% summary()
+
+```
+
+
+
+
+## Subset the data by operations
+
+**Create datasets for each operations**
+
+
+
+Lists with three datasets for each operations created
+
+
+```{r}
+
+
+names_oper <- list("REVASC", "CABG", "PCI")
+names_ep <- list("AF", "INTRACRA", "MI", "STR", "GIBLEEDING")
+#Datasets for each operation are filtered.
+
+
+#All - needed for interactions
+dfs.oper <- lapply(names_oper, function(name){
+    df %>% filter(get(name) == 1) 
+  }) %>% setNames(names_oper) 
+
+lapply(names_oper, function(oper){
+  dfs.oper[[oper]] %>%
+    summarise(oper=oper, n=n(), females=sum(SEX_IMPUTED), fem_p = mean(SEX_IMPUTED)*100, 
+              males=n()-sum(SEX_IMPUTED))
+}) %>%
+  reduce(bind_rows)
+
+```
+
+
+**Calculate preoperative values for variables**
+
+Also CHA~2~DS~2~-VASc score is calculated.
+
+```{r}
+
+dfs.oper <- lapply(names_oper, function(oper){
+  
+  oper_age <- str_glue("{oper}_AGE")
+  dfs.oper[[oper]] %>%
+  mutate(MIPAD = if_else(MI|PAD, 1, 0)) %>%
+  mutate(HYPERCHOL_WIDE = if_else(HYPERCHOL|RX_STATIN, 1, 0)) %>%    
+  rowwise()%>%
+    mutate(MIPAD_AGE = min(MI_AGE, PAD_AGE)) %>%
+    mutate(HYPERCHOL_WIDE_AGE = min(HYPERCHOL_AGE, RX_STATIN_AGE)) %>%
+  ungroup() %>%
+  mutate(oper_AGE_65 = if_else(get(oper_age) >= 65, 1, 0),   
+         oper_AGE_75 = if_else(get(oper_age) >= 75, 1, 0),
+         oper_AGE_65_75 = if_else((oper_AGE_65 == 1 & oper_AGE_75 == 0),1, 0),
+         preop_HEARTFAIL = if_else(HEARTFAIL_AGE < get(oper_age), 1, 0),
+         preop_HYPTENS = if_else(HYPTENS_AGE < get(oper_age), 1, 0),
+         preop_DIABETES = if_else(DIABETES_AGE < get(oper_age), 1, 0),
+         preop_STROKE = if_else(STROKE_AGE < get(oper_age), 1, 0),
+         preop_MIPAD = if_else(MIPAD_AGE < get(oper_age), 1, 0), 
+         preop_VHD = if_else(VHD_AGE < get(oper_age), 1, 0),                      
+         preop_OBESITY = if_else(OBESITY_AGE < get(oper_age), 1, 0),
+         preop_HYPERCHOL_WIDE = if_else(HYPERCHOL_WIDE_AGE < get(oper_age), 1, 0),
+         preop_CHRONKIDNEYDIS =  if_else(CHRONKIDNEYDIS_AGE < get(oper_age), 1, 0),
+         CVSC = preop_HEARTFAIL + preop_HYPTENS + oper_AGE_75 + preop_DIABETES + 
+           2*preop_STROKE + preop_MIPAD + oper_AGE_65 + SEX_IMPUTED, 
+         CVSC_SCALED = scale(CVSC)[,1])
+  
+}) %>% setNames(names_oper) 
+
+
+```
+
+
+**Prevalent cases removed and simplified**
+
+```{r}
+
+#Datasets for each operation are filtered and added to list
+
+covs <- c("batch2", "BL_YEAR","PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8","PC9", "PC10")
+discovs <- c( "preop_HYPTENS", "preop_OBESITY", "preop_DIABETES",  "preop_HYPERCHOL_WIDE", "preop_CHRONKIDNEYDIS")
+
+#Lists of dataframes for each operations and each endpoint of interest
+#PREVALENT ARE REMOVED
+
+dfs <- lapply(names_oper, function(oper){
+  my_create_sub_dfs(oper, dfs.oper, names_ep, c(covs, "SEX_IMPUTED", "CABG_FIRST","CABG", "PCI", discovs)) }) %>% 
+  setNames(names_oper) 
+
+#n for REVASCS
+
+lapply(dfs$REVASC, dim)
+
+```
+
+
+**Divided to two dataset by sex**
+
+```{r}
+
+#Females
+dfs.f <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      dfs[[oper]][[ep]] %>% filter(SEX_IMPUTED==1) 
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+
+#Males
+dfs.m <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      dfs[[oper]][[ep]] %>% filter(SEX_IMPUTED==0) 
+  }) %>% setNames(names_ep)
+}) %>% setNames(names_oper)
+
+
+```
+
+<details>
+  <summary>**Mean followup time**</summary>
+
+Women
+
+```{r}
+
+lapply(names_oper, function(oper){
+  dfs.f[[oper]][["AF"]] %>%
+    summarise(mean = mean(AGE_DIFF), median = median(AGE_DIFF))
+})%>% setNames(names_oper)
+
+```
+
+Men
+
+```{r}
+
+lapply(names_oper, function(oper){
+  dfs.m[[oper]][["AF"]] %>%
+    summarise(mean = mean(AGE_DIFF), median = median(AGE_DIFF))
+})%>% setNames(names_oper)
+
+```
+
+</details>
+
+**Correlation between clinical and AF genetic score:**
+
+All
+
+```{r}
+
+#Spearman
+cor(dfs$REVASC$AF$CVSC_SCALED, dfs$REVASC$AF$AF_SCALED, method = "spearman")
+
+```
+
+
+Women
+
+```{r}
+
+#Spearman
+cor(dfs.f$REVASC$AF$CVSC_SCALED, dfs.f$REVASC$AF$AF_SCALED, method = "spearman")
+
+```
+
+Men
+
+```{r}
+
+cor(dfs.m$REVASC$AF$CVSC_SCALED, dfs.m$REVASC$AF$AF_SCALED, method = "spearman")
+
+```
+
+
+
+## Characteristics tables for each operations
+
+Here all characteristics are at the age of operation. 
+
+```{r}
+
+myVars <-  c("AGE_DIFF", "REVASC_AGE", "CABG_FIRST", discovs)
+catVars <- c("CABG_FIRST", discovs)
+chr_rownames <- c("Follow up, years (SD)", "Age, years (SD)", "CABG first, n (%)")
+
+
+#AF
+strata <- "AF"
+chr.af.f <- CreateTableOne(vars=myVars, data=dfs.f[["REVASC"]][[strata]], factorVars = catVars, strata=strata, test=F) 
+chr.af.m <- CreateTableOne(vars=myVars, data=dfs.m[["REVASC"]][[strata]], factorVars = catVars, strata=strata, test=F)
+chr.af.all <- CreateTableOne(vars=myVars, data=dfs[["REVASC"]][[strata]], factorVars = catVars, test=F) 
+
+#IC bleeding
+strata <- "INTRACRA"
+chr.ich.f <- CreateTableOne(vars=myVars, data=dfs.f[["REVASC"]][[strata]], factorVars = catVars, strata=strata, test=F) 
+chr.ich.m <- CreateTableOne(vars=myVars, data=dfs.m[["REVASC"]][[strata]], factorVars = catVars, strata=strata, test=F)   
+chr.ich.all <- CreateTableOne(vars=myVars, data=dfs[["REVASC"]][[strata]], factorVars = catVars, test=F) 
+
+```
+
+
+**Women**
+
+```{r, include=F, echo=F}
+#This removes individual level data
+chr.ich.f <- print(chr.ich.f)
+chr.ich.f[c(6,9),2] <- "-"
+
+```
+
+```{r}
+chr.af.f 
+chr.ich.f
+```
+
+
+
+**Men**
+
+```{r}
+chr.af.m
+chr.ich.m 
+```
+
+
+**All**
+
+
+```{r}
+chr.af.all
+chr.ich.all
+```
+
+
+## Linearized rate
+
+
+
+<details>  <summary>**Linearized rate**</summary>
+
+*Women*
+
+```{r}
+
+
+linrate.f.l <- lapply(names_ep, function(ep){
+  dfs.f[["REVASC"]][[ep]] %>%
+    group_by(get(str_glue("{ep}_CAT"))) %>%
+    summarise(lin_rate=(sum(get(ep))/sum(FU_END_AGE-REVASC_AGE))*100, n=n(), nevent=sum(get(ep))) %>%
+    rename(PRS=`get(str_glue("{ep}_CAT"))`)
+})%>%setNames(names_ep)
+
+
+linrate.f.l
+
+```
+
+
+*Men*
+
+```{r}
+
+
+linrate.m.l <- lapply(names_ep, function(ep){
+  dfs.m[["REVASC"]][[ep]] %>%
+    group_by(get(str_glue("{ep}_CAT"))) %>%
+    summarise(lin_rate=(sum(get(ep))/sum(FU_END_AGE-REVASC_AGE))*100, n=n(), nevent=sum(get(ep)))  %>%
+    rename(PRS=`get(str_glue("{ep}_CAT"))`)
+})%>%setNames(names_ep)
+
+
+linrate.m.l
+
+
+```
+
+</details>
+
+# Survival analysis
+
+
+<details><summary>**KM plots for each endpoint**</summary>
+
+**Model by survfit**
+
+```{r}
+
+names_oper=list("REVASC")
+
+kms.f <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      survfit(Surv(AGE_DIFF, get(ep)) ~ get(str_glue("{ep}_CAT")), data=dfs.f[[oper]][[ep]])
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+
+
+kms.m <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      survfit(Surv(AGE_DIFF, get(ep)) ~ get(str_glue("{ep}_CAT")), data=dfs.m[[oper]][[ep]])
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+```
+
+**The plot**
+
+```{r, fig.width=10, fig.height=5}
+
+for(oper in unlist(names_oper)) {
+  ep=names_ep[[1]]   #Tämän alustuksen tarve on kyllä ihme juttu. Suoritus kaatuu ilman sitä.
+  
+  plot_list <- lapply(names_ep, function(ep){
+    #print(str_glue("{oper}-{ep}"))
+    my_ggkmplot(kms.f[[oper]][[ep]], str_glue("{oper}-{ep}"), my_labels, nr_col=4) 
+  }) 
+  plots <- arrange_ggsurvplots(plot_list, nrow = 2, ncol = 3, title = "Kaplan Meier curves, women", print=F)
+  ggsave(file = str_glue("{fig_path}/km.prs.{oper}.f.png"), plot = plots, height = 6, width = 12, dpi = 200)
+}
+
+
+for(oper in unlist(names_oper)) {
+  ep=names_ep[[1]]   #Tämän alustuksen tarve on kyllä ihme juttu. Suoritus kaatuu ilman sitä.
+  
+  plot_list <- lapply(names_ep, function(ep){
+    print(str_glue("{oper}-{ep}"))
+    my_ggkmplot(kms.m[[oper]][[ep]], str_glue("{oper}-{ep}"), my_labels, nr_col=4) 
+  }) 
+  plots <- arrange_ggsurvplots(plot_list, nrow = 2, ncol = 3, title = "Kaplan Meier curves, men", print=T)
+  ggsave(file = str_glue("{fig_path}/km.prs.{oper}.m.png"), plot = plots, height = 6, width = 12, dpi = 200)
+}
+
+```
+
+**Females**
+
+![KM curves](figs2/km.prs.REVASC.f.png)
+
+**Males**
+
+![KM curves](figs2/km.prs.REVASC.m.png)
+</details>
+
+<details><summary>**cloglog curves for each endpoint**</summary>
+
+
+
+```{r, fig.width=10, fig.height=5}
+
+for(oper in unlist(names_oper)) {
+  ep=names_ep[[1]]   #Tämän alustuksen tarve on kyllä ihme juttu. Suoritus kaatuu ilman sitä.
+  
+  plot_list <- lapply(names_ep, function(ep){
+    #print(str_glue("{oper}-{ep}"))
+    my_ggkmplot(kms.f[[oper]][[ep]], str_glue("{oper}-{ep}"), my_labels, nr_col=4, fun="cloglog", xlim=c(1,30)) 
+  }) 
+  plots <- arrange_ggsurvplots(plot_list, nrow = 2, ncol = 3, title = "Loglog curves, women", print=F)
+  ggsave(file = str_glue("{fig_path}/log.prs.{oper}.f.png"), plot = plots, height = 6, width = 12, dpi = 200)
+}
+
+
+for(oper in unlist(names_oper)) {
+  ep=names_ep[[1]]   #Tämän alustuksen tarve on kyllä ihme juttu. Suoritus kaatuu ilman sitä.
+  
+  plot_list <- lapply(names_ep, function(ep){
+    print(str_glue("{oper}-{ep}"))
+    my_ggkmplot(kms.m[[oper]][[ep]], str_glue("{oper}-{ep}"), my_labels, nr_col=4, fun="cloglog", xlim=c(1,30)) 
+  }) 
+  plots <- arrange_ggsurvplots(plot_list, nrow = 2, ncol = 3, title = "Loglog curves, men", print=T)
+  ggsave(file = str_glue("{fig_path}/log.prs.{oper}.m.png"), plot = plots, height = 6, width = 12, dpi = 200)
+}
+
+```
+
+
+**Females**
+
+![cloglog](figs2/log.prs.REVASC.f.png)
+
+
+**Males**
+
+![cloglog](figs2/log.prs.REVASC.m.png)
+
+
+
+</details>
+
+## Cox model: covariate adjusted, continuous score
+
+
+**Running models**
+
+
+```{r}
+covs_f<- paste(c(covs,discovs), collapse = " + ")
+
+names_oper=list("REVASC", "CABG", "PCI")
+
+cxs.cs.f <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_SCALED + {oper}_AGE + CABG_FIRST + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs.f[[oper]][[ep]])
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+
+cxs.cs.m <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_SCALED + {oper}_AGE + CABG_FIRST + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs.m[[oper]][[ep]])
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+
+
+cxs.cs.i <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_SCALED*SEX_IMPUTED + {oper}_AGE + CABG_FIRST + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs[[oper]][[ep]])
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+
+
+
+```
+
+
+**Table: Hazard rations**
+
+
+```{r}
+
+dflist <- list(f=dfs.f, m=dfs.m, b=dfs)
+cxlist <- list(f=cxs.cs.f, m=cxs.cs.m, i=cxs.cs.i)
+
+hr_table   <- my_cxlist_to_hrtable_list_sex(list("REVASC", "CABG", "PCI"),   names_ep, dflist, cxlist)
+
+    
+hr_table %>%
+  knitr::kable() %>% 
+  kable_classic(full_width=F, position="left") %>%  
+  pack_rows("REVASC",1, 5) %>%
+  pack_rows("CABG",6, 10) %>% 
+  pack_rows("PCI",11, 15) %>%
+  row_spec(0,bold=T) %>%
+  add_header_above(c(" "=1, "Female"=4, "Male"=4, "Interaction"=2), bold=T)
+
+
+```
+
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r, eval=F}
+
+lapply(cxs.cs.f, print)
+lapply(cxs.cs.m, print)
+
+```
+
+</details>
+<br>
+
+
+
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r}
+
+lapply(cxs.cs.m, print)
+lapply(cxs.cs.f, print)
+lapply(cxs.cs.i, print)
+
+```
+
+
+
+</details>
+<br>
+
+<details><summary>**Proportional hazard assumption**</summary>
+
+Schoenfeld residuals against the transformed time
+
+
+```{r}
+extract_ph_test <- function(cx){
+  tmp <- cox.zph(cx)
+  tmp$table[c(1:6, 16),]
+}
+
+lapply(names_oper, function(oper){
+  tryCatch(extract_ph_test(cxs.cs.f[[oper]][["AF"]]), error=function(e) NULL)
+}) %>% setNames(names_oper) 
+
+lapply(names_oper, function(oper){
+  tryCatch(extract_ph_test(cxs.cs.m[[oper]][["AF"]]), error=function(e) NULL)
+}) %>% setNames(names_oper) 
+
+extract_ph_test <- function(cx){
+  tmp <- cox.zph(cx)
+  tmp$table[c(1:7, 17, 18),]
+}
+
+lapply(names_oper, function(oper){
+  tryCatch(extract_ph_test(cxs.cs.i[[oper]][["AF"]]), error=function(e) NULL)
+}) %>% setNames(names_oper) 
+
+
+
+```
+
+</details>
+<br>
+
+
+## Cox model: covariate adjusted, categorized score
+
+
+**Running models**
+
+```{r}
+
+names_ep <- list("AF", "INTRACRA")
+oper="REVASC"
+
+cxs.f <- 
+  lapply(names_ep, function(ep){
+      df_tmp <- dfs.f[[oper]][[ep]] %>%
+        mutate(!!str_glue("{ep}_CAT") := relevel(get(str_glue("{ep}_CAT")), ref = my_ref))
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_CAT + {oper}_AGE + CABG_FIRST + {covs_f}")
+      coxph(as.formula(my_formula), data=df_tmp)
+  }) %>% setNames(names_ep) 
+
+
+cxs.m <- 
+  lapply(names_ep, function(ep){
+      df_tmp <- dfs.m[[oper]][[ep]] %>%
+        mutate(!!str_glue("{ep}_CAT") := relevel(get(str_glue("{ep}_CAT")), ref = my_ref))
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_CAT +  {oper}_AGE + CABG_FIRST + {covs_f}")
+      coxph(as.formula(my_formula), data=df_tmp)
+  }) %>% setNames(names_ep) 
+
+
+
+cxs.i <- 
+  lapply(names_ep, function(ep){
+      df_tmp <- dfs[[oper]][[ep]] %>%
+        mutate(!!str_glue("{ep}_CAT") := relevel(get(str_glue("{ep}_CAT")), ref = my_ref))
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_CAT*SEX_IMPUTED + {oper}_AGE + CABG_FIRST + {covs_f}")
+      coxph(as.formula(my_formula), data=df_tmp)
+  }) %>% setNames(names_ep) 
+
+
+
+
+```
+
+
+**Table: Hazard ratios/AF**
+
+```{r}
+#Hazard tables generated
+
+ep <- "AF"
+hr.table.f <-  my_cx_to_hrtable_cat(cxs.f[[ep]], dfs.f[[oper]][[ep]], ep, select="_CAT")
+hr.table.m <- my_cx_to_hrtable_cat(cxs.m[[ep]], dfs.m[[oper]][[ep]], ep, select="_CAT")
+
+#Interaction column generated (this could be simplified lot)
+tmp <- my_extr_coef(cxs.i[[ep]], select=":SEX", mytitle=oper) %>%
+  my_tidy_table() %>%
+  select(names, pval) %>%
+  rename(PRS=names) %>%
+  mutate(PRS = str_remove_all (PRS, ".*_CAT|:SEX_IMPUTED"))
+  
+hr.table.i <- extract_ns2(ep, str_glue("{ep}_CAT"), dfs[[oper]][[ep]]) %>%
+  select(quantile) %>%
+  rename(PRS = quantile) %>%
+  left_join(tmp, by="PRS") %>%
+  mutate(pval=if_else(is.na(pval), "-", pval)) %>%
+  add_row(PRS="REVASC", pval="", .before=1) %>%
+  rename(`P-value`=pval)
+
+linrate2.f <- linrate.f.l[[ep]]
+names(linrate2.f) <- c("PRS", "Per 100 person-yrs", "n", "nevent")
+linrate2.f <- linrate2.f %>%
+  select("PRS", "Per 100 person-yrs") %>%
+  mutate_at("Per 100 person-yrs", ~as.character(round(.,2))) %>%
+  add_row(PRS="REVASC", `Per 100 person-yrs`="", .before=1) 
+
+linrate2.m <- linrate.m.l[[ep]]
+names(linrate2.m) <- c("PRS", "Per 100 person-yrs", "n", "nevent")
+linrate2.m <- linrate2.m %>%
+  select("PRS", "Per 100 person-yrs") %>%
+  mutate_at("Per 100 person-yrs", ~as.character(round(.,2))) %>%
+  add_row(PRS="REVASC", `Per 100 person-yrs`="", .before=1) 
+
+
+cbind(hr.table.f, linrate2.f[,-1], hr.table.m[,-1],linrate2.m[,-1], hr.table.i[,-1]) %>%
+  knitr::kable() %>% 
+  kable_classic(font_size=12)  %>%
+  row_spec(c(0,1),bold=T) %>%
+  column_spec(c(5,9), width="2.5cm") %>%
+  add_header_above(c(" "=1, "Female"=4, "Male"=4, "Interaction"=1), bold=T) 
+
+```
+
+
+**Table: Hazard ratios/INTRACRA**
+
+```{r}
+#Hazard tables generated
+
+ep <- "INTRACRA"
+hr.table.f <-  my_cx_to_hrtable_cat(cxs.f[[ep]], dfs.f[[oper]][[ep]], ep, select="_CAT")
+hr.table.m <- my_cx_to_hrtable_cat(cxs.m[[ep]], dfs.m[[oper]][[ep]], ep, select="_CAT")
+
+#Interaction column generated (this could be simplified lot)
+tmp <- my_extr_coef(cxs.i[[ep]], select=":SEX", mytitle=oper) %>%
+  my_tidy_table() %>%
+  select(names, pval) %>%
+  rename(PRS=names) %>%
+  mutate(PRS = str_remove_all (PRS, ".*_CAT|:SEX_IMPUTED"))
+  
+hr.table.i <- extract_ns2(ep, str_glue("{ep}_CAT"), dfs[[oper]][[ep]]) %>%
+  select(quantile) %>%
+  rename(PRS = quantile) %>%
+  left_join(tmp, by="PRS") %>%
+  mutate(pval=if_else(is.na(pval), "-", pval)) %>%
+  add_row(PRS="REVASC", pval="", .before=1) %>%
+  rename(`P-value`=pval)
+
+linrate2.f <- linrate.f.l[[ep]]
+names(linrate2.f) <- c("PRS", "Per 100 person-yrs", "n", "nevent")
+linrate2.f <- linrate2.f %>%
+  select("PRS", "Per 100 person-yrs") %>%
+  mutate_at("Per 100 person-yrs", ~as.character(round(.,2))) %>%
+  add_row(PRS="REVASC", `Per 100 person-yrs`="", .before=1) 
+
+linrate2.m <- linrate.m.l[[ep]]
+names(linrate2.m) <- c("PRS", "Per 100 person-yrs", "n", "nevent")
+linrate2.m <- linrate2.m %>%
+  select("PRS", "Per 100 person-yrs") %>%
+  mutate_at("Per 100 person-yrs", ~as.character(round(.,2))) %>%
+  add_row(PRS="REVASC", `Per 100 person-yrs`="", .before=1) 
+
+
+cbind(hr.table.f, linrate2.f[,-1], hr.table.m[,-1],linrate2.m[,-1], hr.table.i[,-1]) %>%
+  knitr::kable() %>% 
+  kable_classic(font_size=12)  %>%
+  row_spec(c(0,1),bold=T) %>%
+  column_spec(c(5,9), width="2.5cm") %>%
+  add_header_above(c(" "=1, "Female"=4, "Male"=4, "Interaction"=1), bold=T) 
+
+
+```
